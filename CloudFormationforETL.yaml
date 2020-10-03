@@ -1,0 +1,239 @@
+Parameters:
+
+  DBName:
+    Default: postgres
+    Description: My database
+    Type: String
+    MinLength: '1'
+    MaxLength: '64'
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters.
+
+  DBUsername:
+    NoEcho: 'true'
+    Description: Username for MySQL database access
+    Type: String
+    MinLength: '1'
+    MaxLength: '16'
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: must begin with a letter and contain only alphanumeric characters.
+
+  DBPassword:
+    NoEcho: 'true'
+    Description: Password MySQL database access
+    Type: String
+    MinLength: '8'
+    MaxLength: '41'
+    AllowedPattern: '[a-zA-Z0-9]*'
+    ConstraintDescription: must contain only alphanumeric characters.
+
+Resources:
+
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: "cron(0 14 * * ? *)"
+      State: "ENABLED"
+      Targets:
+        -
+          Arn: !GetAtt ETL.Arn
+          Id: AWSETL
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ETL.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+  ETL:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.7
+      Role: !GetAtt ETLRole.Arn
+      Handler: lambda_function.lambda_handler
+      MemorySize: 512
+      Timeout: 5
+      Environment:
+        Variables:
+          database: !Ref DBName
+          endpoint: !GetAtt DBInstance.Endpoint.Address
+          jh: https://raw.githubusercontent.com/datasets/covid-19/master/data/time-series-19-covid-combined.csv
+          nyt: https://raw.githubusercontent.com/nytimes/covid-19-data/master/us.csv
+          password: !Ref DBPassword
+          port: !GetAtt DBInstance.Endpoint.Port
+          region: us-east-1
+          sns: !Ref ETLSNS
+          user: !Ref DBUsername
+      Code:
+        ZipFile: |
+          import boto3
+          import pandas as pd
+          import transformation
+          import psycopg2
+          import os
+
+          rdsEndpoint = os.environ['endpoint']
+          rdsPort = os.environ['port']
+          rdsUser = os.environ['user']
+          rdsRegion = os.environ['region']
+          rdsDatabaseName = os.environ['database']
+          rdsPassword = os.environ['password']
+          johnHopkinsURL = os.environ['jh']
+          nytURL = os.environ['nyt']
+          snsARN = os.environ['sns']
+
+          def notify(text):
+              try:
+                  sns = boto3.client('sns')
+                  sns.publish(TopicArn = snsARN, Message = text)
+              except Exception as e:
+                  print("Not able to send SMS due to {}".format(e))
+                  exit(1)
+
+          def database_connection():
+              try:
+                  conn = psycopg2.connect(host=rdsEndpoint, port=rdsPort, database=rdsDatabaseName, user=rdsUser, password=rdsPassword)
+                  return conn
+              except Exception as e:
+                  notify("Database connection failed due to {}".format(e))
+                  exit(1)
+
+          def first_insert(dfFinal,data):
+              for i in dfFinal.index:
+                  row = (dfFinal.loc[i,'date'], int(dfFinal.loc[i,'cases']),int(dfFinal.loc[i,'deaths']),int(dfFinal.loc[i,'recovered']))
+                  data.append(row)
+              records = ','.join(['%s'] * len(data))
+              query = "insert into etl (reportdate,cases,deaths,recovered) values{}".format(records)
+              return query,data
+
+          def everyday_insert(dfFinal,data,days):
+              for i in range(days):
+                  row = (dfFinal.loc[dfFinal.shape[0]-days+i,'date'], int(dfFinal.loc[dfFinal.shape[0]-days+i,'cases']), int(dfFinal.loc[dfFinal.shape[0]-days+i,'deaths']),int(dfFinal.loc[dfFinal.shape[0]-days+i,'recovered']))
+                  data.append(row)
+              records = ','.join(['%s'] * len(data))
+              query = "insert into etl (reportdate,cases,deaths,recovered) values{}".format(records)
+              return query,data
+
+          def transform(dfNYT,dfJH):
+              dfJH = dfJH[dfJH['Country/Region']=='US'].drop(columns='Country/Region')
+              dfJH.columns = ['date','recovered']
+              dfNYT['date'] = pd.to_datetime(dfNYT['date'],format='%Y-%m-%d')
+              dfJH['date'] = pd.to_datetime(dfJH['date'],format='%Y-%m-%d')
+              dfNYT.set_index('date', inplace=True)
+              dfJH.set_index('date',inplace=True)
+              dfJH['recovered'] = dfJH['recovered'].astype('int64')
+              dfFinal = dfNYT.join(dfJH, how='inner')
+              dfFinal.reset_index(inplace=True)
+              return dfFinal
+
+          def lambda_handler(event, context):
+
+              dfNYT = pd.read_csv(nytURL)
+              dfJH = pd.read_csv(johnHopkinsURL,usecols=['Date','Country/Region','Recovered'])
+              try:
+                  dfFinal = transformation.transform(dfNYT,dfJH)
+              except Exception as e:
+                  notify("Transform function raised exception because {}",format(e))
+                  exit(1)
+              conn = database_connection()
+              cur = conn.cursor()
+              data = []
+              cur.execute("""SELECT to_regclass('etl')""")
+              query_results = cur.fetchall()
+              if query_results[0][0]==None:
+                  try:
+                      query = """CREATE TABLE etl (reportdate date PRIMARY KEY, cases integer, deaths integer, recovered integer)"""
+                      cur.execute(query)
+                  except Exception as e:
+                      notify("Exception raised while creation of table because {}".format(e))
+                      exit(1)
+                  try:
+                      query,data = first_insert(dfFinal,data)
+                      cur.execute(query,data)
+                  except Exception as e:
+                      notify("Couldn't complete first time data insertion in the table because {}".format(e))
+                      exit(1)
+                  notify("Table is created and data insertion is done")
+              else:
+                  cur.execute("""SELECT max(reportdate) from etl""")
+                  query_results = cur.fetchall()
+                  diff = max(dfFinal['date']).date()-query_results[0][0]
+                  if diff.days>0:
+                      try:
+                          query,data = everyday_insert(dfFinal,data,diff.days)
+                          cur.execute(query,data)
+                      except Exception as e:
+                          notify("Daily insertion of data is unsuccessful because {}".format(e))
+                          exit(1)
+                      notify("Today "+str(diff.days)+" rows updated")
+                  else:
+                      notify("Data is not updated yet")
+              conn.commit()
+      Layers:
+        - arn:aws:lambda:us-east-1:251566558623:layer:python37-layer-pandas-gbq:1
+        - arn:aws:lambda:us-east-1:898466741470:layer:psycopg2-py37:3
+
+  ETLRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: SNS-Log-VPC
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:*
+                Resource: "*"
+
+  LambdaFunctionLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    DependsOn: "ETL"
+    Properties:
+      RetentionInDays: 7
+      LogGroupName: !Join ["", ["/aws/lambda/", !Ref ETL]]
+
+  ETLSNS:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: "itsvikrams@gmail.com"
+          Protocol: email
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: 20
+      BackupRetentionPeriod: 0
+      DBName: !Ref DBName
+      DBInstanceClass: db.t2.micro
+      DBSecurityGroups:
+        - !Ref DBSecurityGroup
+      Engine: postgres
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      MaxAllocatedStorage: 20
+      MultiAZ: false
+
+  DBSecurityGroup:
+    Type: AWS::RDS::DBSecurityGroup
+    Properties:
+      DBSecurityGroupIngress:
+        CIDRIP: 0.0.0.0/0
+      GroupDescription: "SG for RDS"
