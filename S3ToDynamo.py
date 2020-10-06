@@ -1,14 +1,20 @@
 import boto3
 import csv
+import pandas as pd
+import io
+import requests
+url="https://raw.githubusercontent.com/nytimes/covid-19-data/master/us.csv"
+s=requests.get(url).content
+uscsv=pd.read_csv(io.StringIO(s.decode('utf-8')))
 
 def lambda_handler(event, context):
     region='us-east-1'
     recList=[]
     try:            
-        s3=boto3.client('s3')            
+        ##s3=boto3.client('s3')            
         dyndb = boto3.client('dynamodb', region_name=region)
-        confile= s3.get_object(Bucket='pythonetlacloudguruchallenge', Key='us.csv')
-        recList = confile['Body'].read().split('\n')
+        ##confile= s3.get_object(Bucket='pythonetlacloudguruchallenge', Key='us.csv')
+        recList = uscsv['Body'].read().split('\n')
         firstrecord=True
         csv_reader = csv.reader(recList, delimiter=',', quotechar='"')
         print('Print Succeeded')
